@@ -8,7 +8,7 @@
 
 下图为一次 Scene 截图，显示 `irq/376-fts` 线程及各核心的瞬时占用情况；顶部状态栏已裁去。
 
-![Scene 中的 FTS 中断线程与 CPU 占用](images/scene-fts-cropped.jpg)
+<a href="images/scene-fts-cropped.jpg"><img src="images/scene-fts-cropped.jpg" alt="Scene 中的 FTS 中断线程与 CPU 占用" width="320"></a>
 
 亮屏且没有触摸时，触屏中断线程持续占用 CPU 0。一次 2.019 秒的采样记录了 7,291 次 FTS FIFO 读取，约 3,611 次/秒。读取返回成功，首事件和剩余事件数均为 0；同期没有记录到触摸输入。这些数据支持空 FIFO 被反复处理的判断，比单看中断次数更有依据。
 
