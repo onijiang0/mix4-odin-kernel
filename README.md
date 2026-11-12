@@ -1,82 +1,54 @@
-# Xiaomi MIX 4 (odin) 内核 — onijiang0 机型适配版 B11
+# MIX 4 触屏空中断：排查记录与修复思路
 
-> 仅针对本人设备（Xiaomi MIX 4 / odin / SM8350-888+ / HyperOS 1.0.4 / Linux 5.4.281）适配的定制内核源码与构建方案。
-> 基线：[MrNya907/xiaomi_kernel_odin](https://github.com/MrNya907/xiaomi_kernel_odin) @ `ada168693`（LA.UM.9.14.r1-26000-LAHAINA.QSSI15.0）
+> 本仓库此前的 B11 内核仅为个人设备定制，存在兼容性问题，**不是通用内核**。旧版构建脚本、补丁和 Release 仅供历史参考，不建议直接刷入。本文记录的是另一台 MIX 4 当前 ROM 上验证过的触屏驱动方案，并非可直接套用到所有 MIX 4 的内核或模块。
 
-## 内核特性（B11）
+## 问题与证据
 
-| # | 特性 | 说明 |
-|---|------|------|
-| 1 | **SukiSU-Ultra builtin v4.3.0** | 内置（manual hook）方式集成，IOCTL 新架构，配套官方 SukiSU 管理器 v4.3.0；无 kprobe 开销 |
-| 2 | **WALT 调度器开启** | `CONFIG_SCHED_WALT=y`（原厂 defconfig 禁用），窗口负载跟踪 + 触屏加速，UI 提频更快 |
-| 3 | **odin_mode 双档电源** | `/sys/kernel/odin_mode/mode`：均衡（GPU 840MHz 解锁 + CPU 满速）/ 省电（1.2/1.6/1.8G + GPU 540），8 个可调参数 |
-| 4 | **CPU 温控压频解除** | `thermal_cpu_override`：无视 MIUI thermal-engine 的策略性压频（非热触发，纯省电策略） |
-| 5 | **cpu-boost 内核化** | `kernel/sched/walt/cpu-boost.c`：input boost 300ms 三簇默认烧进内核 + 写入钳制（powerkeeper 写 120 自动抬回 300），零脚本依赖 |
-| 6 | **seccomp 真过滤移植** | `allow_native` 位图 + `__seccomp_filter` 入口短路 + `/proc/odin_sectest` 自检节点 |
-| 7 | **FTS / EROFS / lz4kd** | FTS 触屏空 FIFO 退避、EROFS PSI 修复、zram lz4kd 压缩算法 |
-| 8 | DEBUG 后门已移除 | 无 dmesg 提权后门，root 全部走 KSU 正规链路 |
+在亮屏、没有触摸时，触屏中断线程持续占用 CPU 0。单次 2.019 秒采样中，FTS 处理了 7,291 次 FIFO 读取：返回值为成功，首事件为 0，剩余事件数也为 0，约 **3,611 次/秒**；同期没有记录到触摸输入。与此前仅凭中断次数判断不同，这支持「空 FIFO 被反复处理」的结论。
 
-## 实测数据
+中断风暴会带来 CPU 和 SPI 负载，是值得修复的问题；它是否是其他场景所有卡顿的唯一原因，尚无充分证据。出现空 FIFO 的更上游原因也没有完全确定，可能涉及驱动、控制器或中断线，不能仅靠此记录断言硬件故障或某个模块是根因。
 
-| 场景 | 结果 |
-|------|------|
-| 拼多多（压测后） | 13434 帧，Janky 1.27%，p50=5ms / p90=7ms / p95=10ms |
-| 抖音刷视频 | 17471 帧，Janky 0.41%，p50=12ms / p90=24ms / p95=31ms |
-| 20min 三阶段重压 | 无 panic / 无 OOM / 无子系统崩溃 / 温度 54.5°C 无降频 |
+## 已验证的方案
 
-## 仓库结构
+当前设备运行 `5.10.302-qgki-odin-QiuChenly`，触屏驱动是 vendor 模块 `fts_touch_spi_k8.ko`，不是直接把旧 5.4 内核刷入当前 ROM。原驱动 SHA-256：
 
-```
-odin_b11_full.patch   本机内核 vs 基线 ada168693 的完整差异（239 文件，+85488/-7140）
-config/original.config   最终内核配置
-build_now.sh           内核编译脚本（clang r383902b1, LLVM=1）
-one_shot.sh            boot.img 打包脚本（新 Image + 原厂 ramdisk，逐字节验证）
-userspace/             配套用户态守护脚本（见下）
+```text
+1fbfa925380fdd310a3bd169fd4ab7a2c06652980a3ca5b232788f8c4dfa8c8b
 ```
 
-## 用户态守护（userspace/，放 /data/adb/service.d/）
+对该文件进行设备专用的二进制试验：首次 FIFO 读取成功、首事件为空且没有后续事件时累计空读；连续 4 次后请求 1、2、4 ms 逐级退避并封顶；读到非空事件或读取失败时复位计数。该设备的中断为低电平触发，且配置了 `IRQF_ONESHOT`；试验方案在中断线程中调用 `msleep`。由于 `CONFIG_HZ=250` 和调度因素，实际等待时间不保证等于请求值。
 
-| 脚本 | 功能（30s 循环维持） |
-|------|---------------------|
-| `96-odin-override.sh` | 开机解除 MIUI thermal-engine CPU 压频 + 清存量 freq_qos cap |
-| `97-priority-guard.sh` | ① GMS 全家钉小核 ② 支付宝 helper 子进程钉小核（主进程豁免）③ SystemUI renice -10 ④ **小米推送风暴压制**：xmsf 三件套从 foreground CPU 组（shares 5120）挪 background（1024）+ nice +10，推送突发上限约前台 1/5 算力，推送本身（网络等待）不受影响 |
+旧方案曾使用 `disable_irq` 配合延迟工作重新启用中断；当前二进制试验采用线程内休眠，两者**并不等价**，不能把旧驱动代码或偏移直接套用到新 ROM。
 
-> 风暴压制基于内核 CFS 调度机制（cpu.shares 权重 + cpuset + nice），无进程删除、无黑名单，温和可逆。
+通过 SukiSU 早期 init 配置，在 vendor 驱动首次加载之前绑定经过校验的补丁副本，避免热卸载现有触屏驱动。首次重启后核实补丁哈希和挂载来源一致；亮屏无触摸 30.53 秒内记录 3,810 次中断，约 **125 次/秒**，比上述基线下降约 **96.5%**。试验中灭屏中断停止，唤醒后恢复约 125 次/秒；用户反馈触摸可以使用。尚未量化真实触摸尾延迟、多指、长时间运行和所有 SystemUI 卡顿场景，也未通过人为制造开机故障验证自动回退。
 
-## 已知良性问题
+## 适配与回退原则
 
-- `/proc/pressure/*` 正常，但 dmesg 可见 `fs/fuse/file.c:1750 tree_insert WARN_ON`（/sdcard 大量写入时触发）——upstream 已知噪音，5.4.302 同样存在，5.11 重构才消除，无功能影响，**未修**（backport 重构风险 > 收益）。
+1. 先核对设备、ROM、运行内核、驱动来源和完整 SHA-256；只要任一关键条件不匹配，就停止加载二进制补丁。OTA 后必须重新核对，不能靠机型名或内核版本字符串单独判断。
+2. 先备份实际运行槽位对应的 boot、vendor_boot 等必要镜像并校验哈希；不要把旧 ROM 的镜像当作当前备份。保持可恢复路径。
+3. 优先读取匹配的源码、配置和符号版本。仅有二进制时先反汇编验证分支、调用约定、重定位、上下文和中断标志；不能声称已恢复完整原始源码。
+4. 不要盲目卸载运行中的 FTS 驱动：当前版本向 `xiaomi_touch` 注册了回调，热卸载可能留下悬空指针。普通 SukiSU 文件覆盖也可能晚于驱动加载，需要实测实际启动顺序。
+5. 保留其他模块的启动配置；不要无条件清空 SukiSU 共享 `modules.rc`。候选模块采用一次性启动标记：尝试前先消耗标记，只有检查通过才加载；系统启动并满足健康条件后再准备下一次标记。该保护机制仍需单独验证失败场景。
+6. 验证应包括亮屏无人触摸与真实触摸的区分、IRQ 速率、线程 CPU、触控延迟、多指、锁屏唤醒、长时间稳定性和相关内核日志。`adb input swipe` 只能测试系统注入事件，不能替代物理触控测试。
 
-## 构建（WSL / Linux）
+## 给 AI 的提示词
 
-```bash
-# 1. 取基线源码
-git clone https://github.com/MrNya907/xiaomi_kernel_odin.git kernel
-cd kernel && git checkout ada168693
+```text
+你正在排查 Android 手机的触屏中断风暴和卡顿。先检查真实设备与工作区状态，不要把旧会话、旧机型或旧内核的结论当成当前事实。
 
-# 2. 应用本机补丁
-git apply odin_b11_full.patch
+目标：以当前 ROM 为基线，优先分析并做可撤销、最小范围的修复；先验证，再考虑持久化。不要仅靠提高 CPU 频率掩盖问题，也不要声称所有卡顿都有同一个根因。
 
-# 3. 编译（工具链：AOSP clang r383902b1，LLVM=1 LLVM_IAS=1）
-bash build_now.sh            # 产物 out/arch/arm64/boot/Image
-# 或完整流程（编译+打包 boot.img）:
-DRY=1 RAMDISK_SRC=<原厂boot.img> OUT_IMG=out.img bash one_shot.sh <原厂boot.img>
+请按顺序完成：
+1. 确认设备型号、ROM、运行内核、活动槽位和触屏驱动实际加载路径；取得并校验当前槽位必要备份。记录原驱动完整 SHA-256、编译/签名/版本信息，并验证 SukiSU、KPM 或其他加载接口是否真的存在。
+2. 在亮屏无触摸和真实触摸条件下分别采样 IRQ 次数、线程 CPU、输入事件和系统帧耗时。仅在能观察读取返回值、首事件和后续事件时，才判断空 FIFO；区分读取失败和正常触摸事件。保留时间、样本数量和原始证据。
+3. 分析目标驱动的线程上下文、IRQ 类型、IRQF_ONESHOT、休眠/唤醒和已有锁。先寻找匹配源码；如只能反汇编，标注静态推断，核验目标文件哈希、控制流、寄存器、ELF 重定位和可睡眠条件。禁止拿其他版本的偏移或模块直接套用。
+4. 若证据支持空 FIFO 退避，设计仅作用于连续空读的补丁；有效事件和错误路径应有明确处理，避免禁用触控或错误地增加 IRQ depth。考虑触控延迟、FIFO 积压、挂起/恢复、并发和回退。区分线程内等待与 disable_irq + delayed_work，不保证特定毫秒值是精确值。
+5. 优先准备一次性的加载和自动恢复，并先以不改变驱动的方式验证加载时序、SELinux 与回退。不要盲目 rmmod 有已注册回调的驱动；不要覆盖或清空其他模块共享的启动配置。安装到持久模块前，测试版本不匹配跳过、失败恢复和模块禁用。
+6. 多轮复测亮屏无触摸中断率、真实触控、多指、解锁、唤醒、通知栏帧耗时和内核日志。报告结果、限制和仍未证实的原因；触屏设备注册或 adb 注入成功不等于物理触摸正常。
+
+当前这份案例仅可作为参考：设备 MIX 4/odin，运行内核 5.10.302-qgki-odin-QiuChenly，原 FTS 模块 SHA-256 为 1fbfa925380fdd310a3bd169fd4ab7a2c06652980a3ca5b232788f8c4dfa8c8b。任何差异都要求重新分析，不得默认兼容。
 ```
 
-或直接下载 Release 的完整源树快照（`odin-base-src.tar.zst`，含全部补丁已应用）。
+## 状态
 
-## 刷入
-
-- **dd 直刷**（系统内有 root 时）：
-  ```bash
-  adb push boot.img /data/local/tmp/X.img
-  adb shell sha256sum /data/local/tmp/X.img        # 与电脑端哈希核对
-  adb shell dd if=/data/local/tmp/X.img of=/dev/block/bootdevice/by-name/boot_a bs=4M
-  adb shell sync && adb reboot
-  ```
-- **fastboot**：`adb reboot bootloader && fastboot flash boot_a boot.img`
-- 回滚保底：原厂 boot.img 或任一稳定旧内核。
-
-## 适配范围声明
-
-仅适配本人设备（Xiaomi MIX 4， Snapdragon 888+，MIUI/HyperOS 基线 5.4.281 内核）。其他同机型设备理论上可用，但未验证。仅供个人学习与自用，不提供任何担保。
+这是 2026-11-10 对单台设备的试验记录，不提供通用可刷入内核，也不保证此处所述模块适用于其他 ROM。旧仓库文件和历史 Release 的存在不代表它们经过当前方案验证。
